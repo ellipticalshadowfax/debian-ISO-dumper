@@ -1,6 +1,9 @@
 # debian-ISO-dumper
 
 Build a custom Debian installer ISO from a running Debian machine.
+This was created using OpenAI Codex, but will be tested and reviewed before release. 
+As usuall, use at your own risk!
+
 
 ## What this does
 
