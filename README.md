@@ -6,7 +6,7 @@ Build a custom Debian installer ISO from a running Debian machine.
 
 `build-custom-installer.sh` captures package state from the current system and remasters a Debian netinst ISO with a replay payload.
 
-The resulting ISO still uses normal Debian Installer flows (including partitioning), but adds a custom install menu entry that runs a late-stage replay script.
+The resulting ISO still uses normal Debian Installer flows (including partitioning), but adds a **custom install menu entry** that runs a late-stage replay script.
 
 ## Highlights
 
@@ -26,8 +26,6 @@ The resulting ISO still uses normal Debian Installer flows (including partitioni
 ```bash
 sudo ./build-custom-installer.sh --output ./my-custom-debian.iso
 ```
-
-## Common examples
 
 ### Include settings from this machine
 
