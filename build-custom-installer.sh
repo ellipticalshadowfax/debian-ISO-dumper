@@ -84,7 +84,7 @@ resolve_dependencies() {
 [[ ${EUID} -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
 
 BASE_ISO=""
-BASE_ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12-netinst.iso"
+BASE_ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.3.0-amd64-netinst.iso"
 WORKDIR="$(pwd)/build"
 OUTPUT_ISO="$(pwd)/custom-debian-installer.iso"
 HOSTNAME_VALUE="$(hostname -s)"
