@@ -47,6 +47,89 @@ can_use_tui() {
   [[ $USE_TUI -eq 1 ]] && [[ -t 0 ]] && [[ -t 1 ]] && [[ -n "${TERM:-}" ]] && [[ "${TERM:-}" != "dumb" ]] && has_tui
 }
 
+# ---------------------------------------------------------------------------
+# TUI theme: monochrome base, red/orange accents
+# whiptail reads NEWT_COLORS; dialog reads DIALOGRC (we write a tmpfile).
+# ---------------------------------------------------------------------------
+setup_tui_theme() {
+  # whiptail / newt colour string
+  # format: element=foreground,background
+  export NEWT_COLORS='
+root=white,black
+border=white,black
+window=white,black
+shadow=black,black
+title=brightred,black
+button=black,red
+actbutton=white,brightred
+checkbox=white,black
+actcheckbox=brightred,black
+entry=white,black
+label=white,black
+listbox=white,black
+actlistbox=white,red
+sellistbox=white,red
+actsellistbox=white,brightred
+listitem=white,black
+actlistitem=white,red
+textbox=white,black
+acttextbox=brightred,black
+compactbutton=white,black
+emptyscale=white,black
+fullscale=red,black
+helpline=black,white
+roottext=white,black
+'
+
+  # dialog: write a minimal rc to a tempfile and export DIALOGRC
+  local _drc
+  _drc="$(mktemp /tmp/debian-iso-dumper-dialogrc.XXXXXX)"
+  cat > "$_drc" <<'DIALOGRC_EOF'
+# debian-ISO-dumper dialog theme — monochrome + red/orange accents
+use_colors = ON
+screen_color = (WHITE,BLACK,OFF)
+shadow_color = (BLACK,BLACK,ON)
+dialog_color = (WHITE,BLACK,OFF)
+title_color = (RED,BLACK,ON)
+border_color = (WHITE,BLACK,OFF)
+button_active_color = (WHITE,RED,ON)
+button_inactive_color = (WHITE,BLACK,OFF)
+button_key_active_color = (WHITE,RED,ON)
+button_key_inactive_color = (RED,BLACK,OFF)
+button_label_active_color = (WHITE,RED,ON)
+button_label_inactive_color = (WHITE,BLACK,OFF)
+inputbox_color = (WHITE,BLACK,OFF)
+inputbox_border_color = (WHITE,BLACK,OFF)
+searchbox_color = (WHITE,BLACK,OFF)
+searchbox_title_color = (RED,BLACK,ON)
+searchbox_border_color = (WHITE,BLACK,OFF)
+position_indicator_color = (RED,BLACK,ON)
+menubox_color = (WHITE,BLACK,OFF)
+menubox_border_color = (WHITE,BLACK,OFF)
+item_color = (WHITE,BLACK,OFF)
+item_selected_color = (WHITE,RED,ON)
+tag_color = (RED,BLACK,OFF)
+tag_selected_color = (WHITE,RED,ON)
+tag_key_color = (RED,BLACK,OFF)
+tag_key_selected_color = (WHITE,RED,ON)
+check_color = (WHITE,BLACK,OFF)
+check_selected_color = (WHITE,RED,ON)
+uarrow_color = (RED,BLACK,ON)
+darrow_color = (RED,BLACK,ON)
+form_active_text_color = (WHITE,RED,ON)
+form_text_color = (WHITE,BLACK,OFF)
+form_item_readonly_color = (WHITE,BLACK,ON)
+gauge_color = (WHITE,BLACK,OFF)
+border2_color = (WHITE,BLACK,OFF)
+inputbox_border2_color = (WHITE,BLACK,OFF)
+searchbox_border2_color = (WHITE,BLACK,OFF)
+menubox_border2_color = (WHITE,BLACK,OFF)
+DIALOGRC_EOF
+  export DIALOGRC="$_drc"
+  # clean up tempfile on exit (append to any existing trap)
+  trap "rm -f '$_drc'; $(trap -p EXIT | sed "s/trap -- '//;s/' EXIT//")" EXIT
+}
+
 cli_yesno() {
   local prompt="$1"
   local reply=""
@@ -60,13 +143,28 @@ cli_yesno() {
   done
 }
 
+# Return terminal dimensions clamped to requested maximums.
+# Usage: read -r h w < <(tui_dims MAX_H MAX_W)
+tui_dims() {
+  local max_h="${1:-9}" max_w="${2:-78}"
+  local term_h term_w
+  term_h="$(tput lines  2>/dev/null || echo 24)"
+  term_w="$(tput cols   2>/dev/null || echo 80)"
+  local h=$(( max_h < term_h - 2 ? max_h : term_h - 2 ))
+  local w=$(( max_w < term_w - 2 ? max_w : term_w - 2 ))
+  [[ $h -lt 3 ]] && h=3
+  [[ $w -lt 20 ]] && w=20
+  echo "$h $w"
+}
+
 tui_msg() {
   local msg="$1"
   if can_use_tui; then
+    local h w; read -r h w < <(tui_dims 9 78)
     if command -v whiptail >/dev/null 2>&1; then
-      whiptail --title "debian-ISO-dumper" --infobox "$msg" 9 78
+      whiptail --title "debian-ISO-dumper" --infobox "$msg" "$h" "$w"
     else
-      dialog --title "debian-ISO-dumper" --infobox "$msg" 9 78
+      dialog --title "debian-ISO-dumper" --infobox "$msg" "$h" "$w"
     fi
   fi
   echo "$msg"
@@ -75,29 +173,266 @@ tui_msg() {
 tui_yesno() {
   local prompt="$1"
   if can_use_tui; then
+    local h w; read -r h w < <(tui_dims 12 80)
     if command -v whiptail >/dev/null 2>&1; then
-      whiptail --title "debian-ISO-dumper" --yesno "$prompt" 12 90
+      whiptail --title "debian-ISO-dumper" --yesno "$prompt" "$h" "$w"
     else
-      dialog --title "debian-ISO-dumper" --yesno "$prompt" 12 90
+      dialog --title "debian-ISO-dumper" --yesno "$prompt" "$h" "$w"
     fi
   else
     cli_yesno "$prompt"
   fi
 }
 
+# show_checklist TITLE PROMPT item [item ...]
+# Items are the package names (the "tag" fields from the old whiptail triplets).
+# Prints selected package names to stdout, one per line.
+# Controls: arrows / j/k = move, space = toggle, a = select all,
+#           n = deselect all, / = search, enter = confirm, q/esc = abort.
 show_checklist() {
   local title="$1"
   local prompt="$2"
   shift 2
 
-  if command -v whiptail >/dev/null 2>&1; then
-    whiptail --title "$title" --checklist "$prompt" 22 100 14 "$@" 3>&1 1>&2 2>&3
-  elif command -v dialog >/dev/null 2>&1; then
-    dialog --stdout --title "$title" --checklist "$prompt" 22 100 14 "$@"
-  else
-    echo "Error: need whiptail or dialog for interactive package selection." >&2
-    return 1
+  # Collect package names from whiptail-style triplets (tag desc state)
+  local -a items=()
+  while [[ $# -ge 3 ]]; do
+    items+=("$1")   # tag
+    shift 3         # skip desc + state
+  done
+  [[ ${#items[@]} -eq 0 ]] && { echo "No items to display." >&2; return 1; }
+
+  local -a checked=()
+  local i; for (( i=0; i<${#items[@]}; i++ )); do checked+=( 0 ); done
+
+  # Terminal / layout
+  local term_h term_w
+  term_h="$(tput lines 2>/dev/null || echo 24)"
+  term_w="$(tput cols  2>/dev/null || echo 80)"
+  local box_h=$(( term_h - 4 ))
+  local box_w=$(( term_w - 4 ))
+  [[ $box_h -lt 8  ]] && box_h=8
+  [[ $box_w -lt 30 ]] && box_w=30
+  # inner list area: border(1) + title(1) + prompt(1) + blank(1) = 4 top
+  #                  blank(1) + status(1) + border(1)             = 3 bottom
+  local list_h=$(( box_h - 7 ))
+  [[ $list_h -lt 3 ]] && list_h=3
+  local list_w=$(( box_w - 6 ))   # border(1) + arrow(2) + check(4) + pad(1) each side
+
+  local cursor=0 scroll=0 query="" search_mode=0
+  # filtered index → real index
+  local -a view=()
+
+  _rebuild_view() {
+    view=()
+    local idx
+    for (( idx=0; idx<${#items[@]}; idx++ )); do
+      if [[ -z "$query" ]] || [[ "${items[$idx]}" == *"$query"* ]]; then
+        view+=( "$idx" )
+      fi
+    done
+    # clamp cursor
+    [[ ${#view[@]} -eq 0 ]] && { cursor=0; scroll=0; return; }
+    [[ $cursor -ge ${#view[@]} ]] && cursor=$(( ${#view[@]} - 1 ))
+    [[ $cursor -lt 0 ]] && cursor=0
+    # clamp scroll
+    if [[ $cursor -lt $scroll ]]; then scroll=$cursor; fi
+    if [[ $cursor -ge $(( scroll + list_h )) ]]; then scroll=$(( cursor - list_h + 1 )); fi
+  }
+
+  # ANSI helpers (write directly to /dev/tty)
+  local ESC=$'\033'
+  local NL=$'\n'
+  local RED="${ESC}[31m"
+  local BRED="${ESC}[1;31m"
+  local DIM="${ESC}[2m"
+  local BOLD="${ESC}[1m"
+  local RST="${ESC}[0m"
+  local CLS="${ESC}[2J"
+  local HOME="${ESC}[H"
+
+  _draw() {
+    _rebuild_view
+
+    # Build frame lines into a buffer, then flush in one write
+    local out=""
+    out+="${CLS}${HOME}"
+
+    local sel_count=0
+    local ci; for ci in "${checked[@]}"; do (( sel_count += ci )); done
+
+    # top border + title
+    local inner_w=$(( box_w - 2 ))
+    local title_pad=$(( (inner_w - ${#title}) / 2 ))
+    out+="${BRED}"
+    out+="╔"; local bi; for (( bi=0; bi<inner_w; bi++ )); do out+="═"; done; out+="╗${NL}"
+    out+="║${RST}"
+    printf -v _pad '%*s' "$title_pad" ''; out+="$_pad"
+    out+="${BRED}${title}${RST}"
+    local right_pad=$(( inner_w - title_pad - ${#title} ))
+    printf -v _pad '%*s' "$right_pad" ''; out+="$_pad"
+    out+="${BRED}║${RST}${NL}"
+    out+="${BRED}╠"; for (( bi=0; bi<inner_w; bi++ )); do out+="═"; done; out+="╣${RST}${NL}"
+
+    # prompt line
+    local ptext="  ${prompt}"
+    ptext="${ptext:0:$inner_w}"
+    printf -v _pad '%-*s' "$inner_w" "$ptext"; out+="${BRED}║${RST}${_pad}${BRED}║${RST}${NL}"
+
+    # search line
+    local stext
+    if [[ $search_mode -eq 1 ]]; then
+      stext="  ${BRED}/${RST} ${query}_"
+    else
+      stext="  ${DIM}/ to search${RST}"
+      [[ -n "$query" ]] && stext="  ${RED}filter: ${query}${RST}  (/ to clear)"
+    fi
+    # strip ansi for length calc
+    local stext_plain; stext_plain="$(printf '%s' "$stext" | sed 's/\x1b\[[0-9;]*m//g')"
+    printf -v _pad '%-*s' "$(( inner_w - ${#stext_plain} ))" ''
+    out+="${BRED}║${RST}${stext}${_pad}${BRED}║${RST}${NL}"
+
+    out+="${BRED}╠"; for (( bi=0; bi<inner_w; bi++ )); do out+="─"; done; out+="╣${RST}${NL}"
+
+    # list rows
+    local row
+    for (( row=0; row<list_h; row++ )); do
+      local vi=$(( scroll + row ))
+      if [[ $vi -ge ${#view[@]} ]]; then
+        printf -v _pad '%-*s' "$inner_w" ''
+        out+="${BRED}║${RST}${_pad}${BRED}║${RST}${NL}"
+        continue
+      fi
+      local real_idx="${view[$vi]}"
+      local pkg="${items[$real_idx]}"
+      local is_checked="${checked[$real_idx]}"
+      local is_cursor=0; [[ $vi -eq $cursor ]] && is_cursor=1
+
+      # arrow column (2 chars)
+      local arrow="  "
+      [[ $is_cursor -eq 1 ]] && arrow="${BRED}► ${RST}"
+
+      # checkbox (4 chars: space [ X ] space)
+      local chk
+      if [[ $is_checked -eq 1 ]]; then
+        chk="${RED}[${BRED}✓${RST}${RED}]${RST} "
+      else
+        chk="${DIM}[ ] ${RST}"
+      fi
+
+      # package name, truncated
+      local max_name=$(( inner_w - 8 ))  # 2(arrow) + 4(chk) + 2(border pad)
+      local name_disp="${pkg:0:$max_name}"
+      printf -v _pad '%-*s' "$(( max_name - ${#name_disp} ))" ''
+
+      out+="${BRED}║${RST} ${arrow}${chk}${name_disp}${_pad} ${BRED}║${RST}${NL}"
+    done
+
+    # scroll indicators
+    local scroll_info=""
+    [[ $scroll -gt 0 ]] && scroll_info+="${RED}▲${RST} "
+    [[ $(( scroll + list_h )) -lt ${#view[@]} ]] && scroll_info+="${RED}▼${RST}"
+    local si_plain; si_plain="$(printf '%s' "$scroll_info" | sed 's/\x1b\[[0-9;]*m//g')"
+    printf -v _pad '%-*s' "$(( inner_w - 2 - ${#si_plain} ))" ''
+    out+="${BRED}╠${RST} ${scroll_info}${_pad}${BRED}╣${RST}${NL}"
+
+    # status + keys
+    local status_line="  ${BRED}[${sel_count} selected / ${#view[@]} shown]${RST}  spc=toggle  a=all  n=none  enter=ok  q=abort"
+    local sl_plain; sl_plain="$(printf '%s' "$status_line" | sed 's/\x1b\[[0-9;]*m//g')"
+    local trunc_w=$(( inner_w ))
+    [[ ${#sl_plain} -gt $trunc_w ]] && status_line="${status_line:0:$trunc_w}"
+    printf -v sl_plain '%-*s' "$trunc_w" "${sl_plain:0:$trunc_w}"
+    # reprint with ansi preserved but padded
+    local sl_ansi="${status_line}"
+    local sl_ansi_plain; sl_ansi_plain="$(printf '%s' "$sl_ansi" | sed 's/\x1b\[[0-9;]*m//g')"
+    local sl_pad=$(( trunc_w - ${#sl_ansi_plain} ))
+    printf -v _pad '%-*s' "$sl_pad" ''
+    out+="${BRED}║${RST}${sl_ansi}${_pad}${BRED}║${RST}${NL}"
+
+    # bottom border
+    out+="${BRED}╚"; for (( bi=0; bi<inner_w; bi++ )); do out+="═"; done; out+="╝${RST}${NL}"
+
+    printf '%s' "$out" > /dev/tty
+  }
+
+  # Save/restore terminal state
+  local old_stty; old_stty="$(stty -g 2>/dev/null || true)"
+  tput smcup   > /dev/tty 2>/dev/null || true
+  tput civis   > /dev/tty 2>/dev/null || true
+  stty -echo -icanon min 1 time 0 2>/dev/null || true
+
+  local result=1
+  _rebuild_view
+  _draw
+
+  while true; do
+    local key
+    IFS= read -r -s -n1 key 2>/dev/null <>/dev/tty || true
+
+    if [[ $search_mode -eq 1 ]]; then
+      case "$key" in
+        $'\x1b') search_mode=0; query=""; _rebuild_view ;;
+        $'\x7f'|$'\b') query="${query%?}" ;;
+        '') search_mode=0 ;;  # enter closes search
+        *) query+="$key" ;;
+      esac
+      _draw; continue
+    fi
+
+    # handle escape sequences for arrows
+    if [[ "$key" == $'\x1b' ]]; then
+      local seq1 seq2
+      IFS= read -r -s -n1 -t 0.1 seq1 <>/dev/tty || true
+      IFS= read -r -s -n1 -t 0.1 seq2 <>/dev/tty || true
+      key="${key}${seq1}${seq2}"
+    fi
+
+    case "$key" in
+      $'\x1b[A'|k)  # up
+        (( cursor > 0 )) && (( cursor-- ))
+        if [[ $cursor -lt $scroll ]]; then (( scroll-- )); fi
+        ;;
+      $'\x1b[B'|j)  # down
+        (( cursor < ${#view[@]} - 1 )) && (( cursor++ ))
+        if [[ $cursor -ge $(( scroll + list_h )) ]]; then (( scroll++ )); fi
+        ;;
+      $'\x1b[5~')  # page up
+        cursor=$(( cursor - list_h < 0 ? 0 : cursor - list_h ))
+        scroll=$(( cursor < scroll ? cursor : scroll ))
+        ;;
+      $'\x1b[6~')  # page down
+        local last=$(( ${#view[@]} - 1 ))
+        cursor=$(( cursor + list_h > last ? last : cursor + list_h ))
+        if [[ $cursor -ge $(( scroll + list_h )) ]]; then scroll=$(( cursor - list_h + 1 )); fi
+        ;;
+      ' ')  # toggle
+        if [[ ${#view[@]} -gt 0 ]]; then
+          local ri="${view[$cursor]}"
+          checked[$ri]=$(( 1 - checked[$ri] ))
+        fi
+        ;;
+      a)  for (( i=0; i<${#items[@]}; i++ )); do checked[$i]=1; done ;;
+      n)  for (( i=0; i<${#items[@]}; i++ )); do checked[$i]=0; done ;;
+      /)  search_mode=1 ;;
+      ''|$'\n')  # enter — confirm
+        result=0; break ;;
+      q|Q|$'\x1b\x1b')  # quit/abort
+        result=1; break ;;
+    esac
+    _draw
+  done
+
+  # Restore terminal
+  stty "$old_stty"            2>/dev/null || true
+  tput cnorm  > /dev/tty      2>/dev/null || true
+  tput rmcup  > /dev/tty      2>/dev/null || true
+
+  if [[ $result -eq 0 ]]; then
+    for (( i=0; i<${#items[@]}; i++ )); do
+      [[ "${checked[$i]}" -eq 1 ]] && printf '%s\n' "${items[$i]}"
+    done
   fi
+  return $result
 }
 
 resolve_dependencies() {
@@ -197,6 +532,9 @@ done
 
 for c in dpkg-query apt-get apt-cache rsync xorriso tar zstd awk sed mount umount; do require_bin "$c"; done
 
+# Apply theme now that USE_TUI is finalised
+[[ $USE_TUI -eq 1 ]] && setup_tui_theme
+
 
 if [[ $USE_TUI -eq 1 ]] && ! can_use_tui; then
   echo "Notice: TUI requested but unavailable (missing whiptail/dialog, no TTY, or invalid TERM). Falling back to plain terminal prompts." >&2
@@ -241,22 +579,22 @@ if [[ $DOWNLOAD_PACKAGES -eq 1 ]]; then
       echo "No package selection made; aborting offline payload build." >&2
       exit 1
     }
-    PRESELECTED_OFFLINE="$(printf '%s\n' "$CHOICE_RAW" | tr -d '"' | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+    PRESELECTED_OFFLINE="$(printf '%s\n' "$CHOICE_RAW" | sed '/^$/d' | sort -u | tr '\n' ' ')"
   fi
 fi
 
-PLAN_MSG="Ready to run with:\n\n"
-PLAN_MSG+="Workdir: $WORKDIR\nCache dir: $CACHE_DIR\n"
-PLAN_MSG+="Base ISO: $BASE_ISO\nBase URL: $BASE_ISO_URL\n"
-PLAN_MSG+="Output ISO: $OUTPUT_ISO\nHostname seed: $HOSTNAME_VALUE\n"
-PLAN_MSG+="Include settings: $INCLUDE_SETTINGS\nDownload packages: $DOWNLOAD_PACKAGES\n"
+PLAN_MSG="Ready to run with:\n${NL}"
+PLAN_MSG+="Workdir: $WORKDIR\nCache dir: $CACHE_DIR${NL}"
+PLAN_MSG+="Base ISO: $BASE_ISO\nBase URL: $BASE_ISO_URL${NL}"
+PLAN_MSG+="Output ISO: $OUTPUT_ISO\nHostname seed: $HOSTNAME_VALUE${NL}"
+PLAN_MSG+="Include settings: $INCLUDE_SETTINGS\nDownload packages: $DOWNLOAD_PACKAGES${NL}"
 if [[ $DOWNLOAD_PACKAGES -eq 1 ]]; then
-  PLAN_MSG+="Selector scope: $SELECTOR_SCOPE\n"
-  [[ -n "$OFFLINE_PACKAGES_FILE" ]] && PLAN_MSG+="Offline package file: $OFFLINE_PACKAGES_FILE\n"
-  [[ -n "$PRESELECTED_OFFLINE" ]] && PLAN_MSG+="Preselected packages count: $(wc -w <<<"$PRESELECTED_OFFLINE")\n"
+  PLAN_MSG+="Selector scope: $SELECTOR_SCOPE${NL}"
+  [[ -n "$OFFLINE_PACKAGES_FILE" ]] && PLAN_MSG+="Offline package file: $OFFLINE_PACKAGES_FILE${NL}"
+  [[ -n "$PRESELECTED_OFFLINE" ]] && PLAN_MSG+="Preselected packages count: $(wc -w <<<"$PRESELECTED_OFFLINE")${NL}"
 fi
-PLAN_MSG+="Resume mode: $RESUME\n"
-[[ -n "$STOP_AFTER" ]] && PLAN_MSG+="Stop after: $STOP_AFTER\n"
+PLAN_MSG+="Resume mode: $RESUME${NL}"
+[[ -n "$STOP_AFTER" ]] && PLAN_MSG+="Stop after: $STOP_AFTER${NL}"
 PLAN_MSG+="\nProceed?"
 
 if ! tui_yesno "$PLAN_MSG"; then
@@ -361,6 +699,7 @@ if ! is_stage_done payload || [[ $RESUME -eq 0 ]]; then
       tui_msg "Downloading packages and building offline repository..."
       REPO_DIR="$CUSTOM_DIR/repo"
       mkdir -p "$REPO_DIR/pool"
+      chown _apt "$REPO_DIR/pool"
       apt-get update
 
       while IFS= read -r pkg; do
