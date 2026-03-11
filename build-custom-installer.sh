@@ -148,7 +148,7 @@ maybe_stop_after() {
 [[ ${EUID} -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
 
 BASE_ISO=""
-BASE_ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-13.3.0-amd64-netinst.iso"
+BASE_ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKDIR="$SCRIPT_DIR/build"
 CACHE_DIR=""
@@ -196,7 +196,6 @@ done
 }
 
 for c in dpkg-query apt-get apt-cache rsync xorriso tar zstd awk sed mount umount; do require_bin "$c"; done
-[[ $DOWNLOAD_PACKAGES -eq 0 ]] || require_bin apt-ftparchive
 
 
 if [[ $USE_TUI -eq 1 ]] && ! can_use_tui; then
@@ -242,7 +241,7 @@ if [[ $DOWNLOAD_PACKAGES -eq 1 ]]; then
       echo "No package selection made; aborting offline payload build." >&2
       exit 1
     }
-    PRESELECTED_OFFLINE="$(printf '%s\n' "$CHOICE_RAW" | tr ' ' '\n' | tr -d '"' | sed '/^$/d' | sort -u | tr '\n' ' ')"
+    PRESELECTED_OFFLINE="$(printf '%s\n' "$CHOICE_RAW" | tr -d '"' | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' ')"
   fi
 fi
 
@@ -262,13 +261,13 @@ PLAN_MSG+="\nProceed?"
 
 if ! tui_yesno "$PLAN_MSG"; then
   echo "Aborted before making changes."
-  exit 1
+  exit 0
 fi
-mark_stage_done "plan"
-maybe_stop_after "plan"
 
 # Writes/downloads begin here
 mkdir -p "$WORKDIR" "$CACHE_DIR" "$STATE_DIR" "$MNT_BASE" "$PAYLOAD_DIR"
+mark_stage_done "plan"
+maybe_stop_after "plan"
 if [[ $RESUME -eq 0 ]]; then
   rm -rf "$ISO_ROOT" "$PAYLOAD_DIR" "$WORKDIR/tmp-offline-selected.txt"
   mkdir -p "$PAYLOAD_DIR"
@@ -367,13 +366,10 @@ if ! is_stage_done payload || [[ $RESUME -eq 0 ]]; then
       while IFS= read -r pkg; do
         [[ -n "$pkg" ]] || continue
         version="$(awk -F '\t' -v p="$pkg" '$1==p {print $2; exit}' "$PAYLOAD_DIR/package-versions.tsv")"
-        if [[ -n "$version" ]] && apt-get -y download "${pkg}=${version}"; then
-          mv ./*.deb "$REPO_DIR/pool/" 2>/dev/null || true
+        if [[ -n "$version" ]] && (cd "$REPO_DIR/pool" && apt-get -y download "${pkg}=${version}"); then
           continue
         fi
-        if apt-get -y download "$pkg"; then
-          mv ./*.deb "$REPO_DIR/pool/" 2>/dev/null || true
-        else
+        if ! (cd "$REPO_DIR/pool" && apt-get -y download "$pkg"); then
           echo "Warning: could not download $pkg"
         fi
       done < "$PAYLOAD_DIR/offline-expanded.txt"
@@ -430,7 +426,7 @@ d-i preseed/late_command string \
   in-target /bin/bash /root/custom/postinstall.sh
 PRESEED
 
-  if [[ -f "$ISO_ROOT/isolinux/txt.cfg" ]] && ! rg -q "customized Debian from this ISO" "$ISO_ROOT/isolinux/txt.cfg"; then
+  if [[ -f "$ISO_ROOT/isolinux/txt.cfg" ]] && ! grep -q "customized Debian from this ISO" "$ISO_ROOT/isolinux/txt.cfg"; then
     cat >> "$ISO_ROOT/isolinux/txt.cfg" <<'ISOLINUX'
 
 label custom-install
@@ -441,7 +437,7 @@ label custom-install
 ISOLINUX
   fi
 
-  if [[ -f "$ISO_ROOT/boot/grub/grub.cfg" ]] && ! rg -q "customized Debian from this ISO" "$ISO_ROOT/boot/grub/grub.cfg"; then
+  if [[ -f "$ISO_ROOT/boot/grub/grub.cfg" ]] && ! grep -q "customized Debian from this ISO" "$ISO_ROOT/boot/grub/grub.cfg"; then
     cat >> "$ISO_ROOT/boot/grub/grub.cfg" <<'GRUB'
 menuentry 'Install customized Debian from this ISO' {
     linux    /install.amd/vmlinuz preseed/file=/cdrom/preseed.cfg --- quiet
@@ -453,7 +449,7 @@ GRUB
   ISOHYBRID_MBR="/usr/lib/ISOLINUX/isohdpfx.bin"
   XORRISO_ARGS=(
     -as mkisofs -r
-    -V "CUST_DEBIAN13"
+    -V "CUST_DEBIAN12"
     -o "$OUTPUT_ISO"
     -b isolinux/isolinux.bin -c isolinux/boot.cat
     -no-emul-boot -boot-load-size 4 -boot-info-table
