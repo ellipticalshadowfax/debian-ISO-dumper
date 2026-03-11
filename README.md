@@ -3,7 +3,8 @@
 > Snapshot your Debian system. Burn it to an installer. Hand it to anyone.
 
 `debian-ISO-dumper` remasters a standard Debian netinst ISO to replay the exact package state of your running machine on a fresh install — while keeping the normal Debian Installer flows for partitioning, users, locale, and everything else. No custom repos, no PXE server, no Ansible. One script, one ISO.
-
+## NOTICE
+This is AI generated code! Yes, I'm a sell out....
 ---
 
 ## How it works
