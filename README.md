@@ -20,16 +20,15 @@ This is AI generated code! Yes, I'm a sell out....
 ## Requirements
 
 - Debian-based host (must be run as root)
-- `xorriso`, `rsync`, `tar`, `zstd`, `gzip`
-- `dpkg-query`, `apt-get`, `apt-cache`
+- `xorriso`, `tar`, `gzip`, `cp` (coreutils)
+- `dpkg-query`, `apt-get`, `apt-cache`, `dpkg-deb`
 - `curl` or `wget` (for ISO download)
-- `apt-ftparchive` — only if using `--download-packages`
 - `whiptail` or `dialog` — for the interactive TUI (optional, falls back to plain prompts)
 
 Install the build deps on Debian/Ubuntu:
 
 ```bash
-sudo apt install xorriso rsync zstd curl whiptail apt-utils
+sudo apt install xorriso curl whiptail
 ```
 
 ---

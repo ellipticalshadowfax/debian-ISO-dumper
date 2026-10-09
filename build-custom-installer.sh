@@ -89,6 +89,32 @@ validate_url() {
   }
 }
 
+# Resolve the latest Debian netinst ISO URL from the current/ symlink directory.
+# If the provided URL already ends in a valid filename (not a directory), return it as-is.
+# Otherwise fetch the directory listing and pick the first amd64 netinst ISO found.
+resolve_iso_url() {
+  local url="$1"
+  # If it looks like a specific file (has .iso extension), use it directly
+  if [[ "$url" =~ \.iso$ ]]; then
+    printf '%s' "$url"
+    return 0
+  fi
+  # Ensure URL ends with /
+  [[ "$url" == */ ]] || url+="/"
+  local iso_file
+  if command -v curl >/dev/null 2>&1; then
+    iso_file="$(curl -sL --fail "$url" 2>/dev/null | grep -oE 'debian-[0-9]+\.[0-9]+\.[0-9]+-amd64-netinst\.iso' | head -1)" || true
+  elif command -v wget >/dev/null 2>&1; then
+    iso_file="$(wget -qO- "$url" 2>/dev/null | grep -oE 'debian-[0-9]+\.[0-9]+\.[0-9]+-amd64-netinst\.iso' | head -1)" || true
+  fi
+  if [[ -n "$iso_file" ]]; then
+    printf '%s%s' "$url" "$iso_file"
+  else
+    # Fallback: return the original URL (user configured it, let it fail later)
+    printf '%s' "$url"
+  fi
+}
+
 # Safe filesystem path: no null bytes, no newlines
 validate_path() {
   local p="$1" label="$2"
@@ -102,7 +128,7 @@ normalize_path() {
   local p="$1"
   [[ -z "$p" ]] && { echo ""; return; }
   case "$p" in
-    "~"|"~/*") p="${p/#~/$HOME}" ;;
+    ~|~/*) p="${p/#~/$HOME}" ;;
   esac
   if command -v realpath >/dev/null 2>&1; then
     realpath -m -- "$p"
@@ -156,9 +182,8 @@ roottext=white,black
 '
 
   # dialog: write a minimal rc to a tempfile and export DIALOGRC
-  local _drc
-  _drc="$(mktemp /tmp/debian-iso-dumper-dialogrc.XXXXXX)"
-  cat > "$_drc" <<'DIALOGRC_EOF'
+  DIALOGRC_FILE="$(mktemp /tmp/debian-iso-dumper-dialogrc.XXXXXX)"
+  cat > "$DIALOGRC_FILE" <<'DIALOGRC_EOF'
 # debian-ISO-dumper dialog theme — monochrome + red/orange accents
 use_colors = ON
 screen_color = (WHITE,BLACK,OFF)
@@ -199,9 +224,7 @@ inputbox_border2_color = (WHITE,BLACK,OFF)
 searchbox_border2_color = (WHITE,BLACK,OFF)
 menubox_border2_color = (WHITE,BLACK,OFF)
 DIALOGRC_EOF
-  export DIALOGRC="$_drc"
-  # clean up tempfile on exit (append to any existing trap)
-  trap "rm -f '$_drc'; $(trap -p EXIT | sed "s/trap -- '//;s/' EXIT//")" EXIT
+  export DIALOGRC="$DIALOGRC_FILE"
 }
 
 cli_yesno() {
@@ -272,11 +295,12 @@ tui_configure() {
   local -; set +e
   # ── ANSI / layout helpers (same palette as show_checklist) ────────────────
   local ESC=$'\033' NL=$'\n'
-  local RED="${ESC}[31m" BRED="${ESC}[1;31m" DIM="${ESC}[2m" RST="${ESC}[0m"
+  local RED="${ESC}[1m" BRED="${ESC}[1m" DIM="${ESC}[2m" RST="${ESC}[0m"
 
   _rep() { local ch="$1" n="$2" r=""; local j; for((j=0;j<n;j++)); do r+="$ch"; done; printf '%s' "$r"; }
 
-  local box_h box_w inner_w need_resize=0
+  local box_h box_w inner_w
+  _TUI_NEED_RESIZE=0
   _recalc() {
     local th tw
     th="$(tput lines 2>/dev/null||echo 24)"
@@ -342,32 +366,21 @@ tui_configure() {
 
   # ── inline text editor ────────────────────────────────────────────────────
   _edit_field() {
-    # Opens a small whiptail/dialog inputbox, or falls back to readline read.
     local idx=$1 cur_val="${F_VAL[$1]}"
-    if can_use_tui; then
-      local h w; read -r h w < <(tui_dims 10 70)
-      local new_val
-      if command -v whiptail >/dev/null 2>&1; then
-        new_val="$(whiptail --title "debian-ISO-dumper" \
-          --inputbox "${F_DESC[$idx]}" "$h" "$w" "$cur_val" 3>&1 1>&2 2>&3)" || return
-      else
-        new_val="$(dialog --stdout --title "debian-ISO-dumper" \
-          --inputbox "${F_DESC[$idx]}" "$h" "$w" "$cur_val")" || return
-      fi
-      # Strip CR and any embedded newlines whiptail/dialog may append.
-      # Then trim leading/trailing whitespace.  Use [^[:space:]] so the
-      # glob correctly handles all whitespace variants.
-      new_val="${new_val//$'\r'/}"
-      new_val="${new_val//$'\n'/}"
-      new_val="${new_val#"${new_val%%[^[:space:]]*}"}"   # ltrim
-      new_val="${new_val%"${new_val##*[^[:space:]]}"}"   # rtrim
-      F_VAL[$idx]="$new_val"
+    local h w; read -r h w < <(tui_dims 10 70)
+    local new_val
+    if command -v whiptail >/dev/null 2>&1; then
+      new_val="$(whiptail --title "debian-ISO-dumper" \
+        --inputbox "${F_DESC[$idx]}" "$h" "$w" "$cur_val" 3>&1 1>&2 2>&3)" || return
     else
-      printf '\n%s\n[%s]: ' "${F_DESC[$idx]}" "$cur_val" > /dev/tty
-      local reply; IFS= read -r reply < /dev/tty
-      reply="${reply//$'\r'/}"
-      [[ -n "$reply" ]] && F_VAL[$idx]="$reply"
+      new_val="$(dialog --stdout --title "debian-ISO-dumper" \
+        --inputbox "${F_DESC[$idx]}" "$h" "$w" "$cur_val")" || return
     fi
+    new_val="${new_val//$'\r'/}"
+    new_val="${new_val//$'\n'/}"
+    new_val="${new_val#"${new_val%%[^[:space:]]*}"}"
+    new_val="${new_val%"${new_val##*[^[:space:]]}"}"
+    F_VAL[$idx]="$new_val"
   }
 
   # ── cycle choice field ────────────────────────────────────────────────────
@@ -386,7 +399,7 @@ tui_configure() {
 
   # ── draw ──────────────────────────────────────────────────────────────────
   _draw() {
-    [[ $need_resize -eq 1 ]] && { _recalc; need_resize=0; }
+    [[ $_TUI_NEED_RESIZE -eq 1 ]] && { _recalc; _TUI_NEED_RESIZE=0; }
 
     local out="${ESC}[2J${ESC}[H"
     local title="debian-ISO-dumper — configuration"
@@ -484,7 +497,7 @@ tui_configure() {
   }
 
   # ── main loop ─────────────────────────────────────────────────────────────
-  trap 'need_resize=1' WINCH
+  trap '_TUI_NEED_RESIZE=1' WINCH
   local old_stty; old_stty="$(stty -g 2>/dev/null||true)"
   tput smcup > /dev/tty 2>/dev/null||true
   tput civis > /dev/tty 2>/dev/null||true
@@ -497,7 +510,7 @@ tui_configure() {
     local key=""
     IFS= read -r -s -n1 -t 0.15 key 2>/dev/null </dev/tty || true
 
-    [[ $need_resize -eq 1 ]] && { _draw; continue; }
+    [[ $_TUI_NEED_RESIZE -eq 1 ]] && { _draw; continue; }
 
     # Escape sequence: read up to 4 more bytes with a generous timeout
     if [[ "$key" == $'\x1b' ]]; then
@@ -605,258 +618,43 @@ tui_configure() {
 }
 
 # show_checklist TITLE PROMPT item [item ...]
-# Items are the package names (the "tag" fields from the old whiptail triplets).
+# Items are whiptail-style triplets (tag desc state).
 # Prints selected package names to stdout, one per line.
-# Controls: arrows / j/k = move, space = toggle, a = select all,
-#           n = deselect all, / = search, enter = confirm, q/esc = abort.
+# Delegates to whiptail's or dialog's built-in --checklist widget.
 show_checklist() {
-  local -; set +e
   local title="$1"
   local prompt="$2"
   shift 2
 
-  # Collect package names from whiptail-style triplets (tag desc state)
-  local -a items=()
-  while [[ $# -ge 3 ]]; do
-    items+=("$1")   # tag
-    shift 3         # skip desc + state
-  done
-  [[ ${#items[@]} -eq 0 ]] && { echo "No items to display." >&2; return 1; }
+  [[ $# -ge 3 ]] || { echo "No items to display." >&2; return 1; }
 
-  local -a checked=()
-  local i; for (( i=0; i<${#items[@]}; i++ )); do checked+=( 0 ); done
+  local height width list_height
+  height="$(tput lines 2>/dev/null || echo 24)"
+  width="$(tput cols 2>/dev/null || echo 80)"
+  height=$(( height - 6 ))
+  [[ $height -lt 10 ]] && height=10
+  [[ $height -gt 40 ]] && height=40
+  width=$(( width - 6 ))
+  [[ $width -lt 50 ]] && width=50
+  [[ $width -gt 100 ]] && width=100
+  list_height=$(( height - 8 ))
+  [[ $list_height -lt 3 ]] && list_height=3
 
-  # Terminal / layout
-  local term_h term_w
-  term_h="$(tput lines 2>/dev/null || echo 24)"
-  term_w="$(tput cols  2>/dev/null || echo 80)"
-  local box_h=$(( term_h - 4 ))
-  local box_w=$(( term_w - 4 ))
-  [[ $box_h -lt 8  ]] && box_h=8
-  [[ $box_w -lt 30 ]] && box_w=30
-  # inner list area: border(1) + title(1) + prompt(1) + blank(1) = 4 top
-  #                  blank(1) + status(1) + border(1)             = 3 bottom
-  local list_h=$(( box_h - 7 ))
-  [[ $list_h -lt 3 ]] && list_h=3
-  local list_w=$(( box_w - 6 ))   # border(1) + arrow(2) + check(4) + pad(1) each side
-
-  local cursor=0 scroll=0 query="" search_mode=0
-  # filtered index → real index
-  local -a view=()
-
-  _rebuild_view() {
-    view=()
-    local idx
-    for (( idx=0; idx<${#items[@]}; idx++ )); do
-      if [[ -z "$query" ]] || [[ "${items[$idx]}" == *"$query"* ]]; then
-        view+=( "$idx" )
-      fi
-    done
-    # clamp cursor
-    [[ ${#view[@]} -eq 0 ]] && { cursor=0; scroll=0; return; }
-    [[ $cursor -ge ${#view[@]} ]] && cursor=$(( ${#view[@]} - 1 ))
-    [[ $cursor -lt 0 ]] && cursor=0
-    # clamp scroll
-    if [[ $cursor -lt $scroll ]]; then scroll=$cursor; fi
-    if [[ $cursor -ge $(( scroll + list_h )) ]]; then scroll=$(( cursor - list_h + 1 )); fi
-  }
-
-  # ANSI helpers (write directly to /dev/tty)
-  local ESC=$'\033'
-  local RED="${ESC}[31m"
-  local BRED="${ESC}[1;31m"
-  local DIM="${ESC}[2m"
-  local BOLD="${ESC}[1m"
-  local RST="${ESC}[0m"
-  local CLS="${ESC}[2J"
-  local HOME="${ESC}[H"
-
-  _draw() {
-    _rebuild_view
-
-    # Build frame lines into a buffer, then flush in one write
-    local out=""
-    out+="${CLS}${HOME}"
-
-    local sel_count=0
-    local ci; for ci in "${checked[@]}"; do (( sel_count += ci )); done
-
-    # top border + title
-    local inner_w=$(( box_w - 2 ))
-    local title_pad=$(( (inner_w - ${#title}) / 2 ))
-    (( title_pad < 0 )) && title_pad=0
-    out+="${BRED}"
-    out+="╔"; local bi; for (( bi=0; bi<inner_w; bi++ )); do out+="═"; done; out+="╗\n"
-    out+="║${RST}"
-    printf -v _pad '%*s' "$title_pad" ''; out+="$_pad"
-    out+="${BRED}${title:0:$inner_w}${RST}"
-    local right_pad=$(( inner_w - title_pad - ${#title} ))
-    (( right_pad < 0 )) && right_pad=0
-    printf -v _pad '%*s' "$right_pad" ''; out+="$_pad"
-    out+="${BRED}║${RST}\n"
-    out+="${BRED}╠"; for (( bi=0; bi<inner_w; bi++ )); do out+="═"; done; out+="╣${RST}\n"
-
-    # prompt line
-    local ptext="  ${prompt}"
-    ptext="${ptext:0:$inner_w}"
-    printf -v _pad '%-*s' "$inner_w" "$ptext"; out+="${BRED}║${RST}${_pad}${BRED}║${RST}\n"
-
-    # search line
-    local stext
-    if [[ $search_mode -eq 1 ]]; then
-      stext="  ${BRED}/${RST} ${query}_"
-    else
-      stext="  ${DIM}/ to search${RST}"
-      [[ -n "$query" ]] && stext="  ${RED}filter: ${query}${RST}  (/ to clear)"
-    fi
-    # strip ansi for length calc
-    local stext_plain; stext_plain="$(printf '%s' "$stext" | sed 's/\x1b\[[0-9;]*m//g')"
-    local spad=$(( inner_w - ${#stext_plain} ))
-    (( spad < 0 )) && spad=0
-    printf -v _pad '%-*s' "$spad" ''
-    out+="${BRED}║${RST}${stext}${_pad}${BRED}║${RST}\n"
-
-    out+="${BRED}╠"; for (( bi=0; bi<inner_w; bi++ )); do out+="─"; done; out+="╣${RST}\n"
-
-    # list rows
-    local row
-    for (( row=0; row<list_h; row++ )); do
-      local vi=$(( scroll + row ))
-      if [[ $vi -ge ${#view[@]} ]]; then
-        printf -v _pad '%-*s' "$inner_w" ''
-        out+="${BRED}║${RST}${_pad}${BRED}║${RST}\n"
-        continue
-      fi
-      local real_idx="${view[$vi]}"
-      local pkg="${items[$real_idx]}"
-      local is_checked="${checked[$real_idx]}"
-      local is_cursor=0; [[ $vi -eq $cursor ]] && is_cursor=1
-
-      # arrow column (2 chars)
-      local arrow="  "
-      [[ $is_cursor -eq 1 ]] && arrow="${BRED}► ${RST}"
-
-      # checkbox (4 chars: space [ X ] space)
-      local chk
-      if [[ $is_checked -eq 1 ]]; then
-        chk="${RED}[${BRED}✓${RST}${RED}]${RST} "
-      else
-        chk="${DIM}[ ] ${RST}"
-      fi
-
-      # package name, truncated
-      local max_name=$(( inner_w - 8 ))  # 2(arrow) + 4(chk) + 2(border pad)
-      local name_disp="${pkg:0:$max_name}"
-      printf -v _pad '%-*s' "$(( max_name - ${#name_disp} ))" ''
-
-      out+="${BRED}║${RST} ${arrow}${chk}${name_disp}${_pad} ${BRED}║${RST}\n"
-    done
-
-    # scroll indicators
-    local scroll_info=""
-    [[ $scroll -gt 0 ]] && scroll_info+="${RED}▲${RST} "
-    [[ $(( scroll + list_h )) -lt ${#view[@]} ]] && scroll_info+="${RED}▼${RST}"
-    local si_plain; si_plain="$(printf '%s' "$scroll_info" | sed 's/\x1b\[[0-9;]*m//g')"
-    printf -v _pad '%-*s' "$(( inner_w - 2 - ${#si_plain} ))" ''
-    out+="${BRED}╠${RST} ${scroll_info}${_pad}${BRED}╣${RST}\n"
-
-    # status + keys
-    local status_line="  ${BRED}[${sel_count} selected / ${#view[@]} shown]${RST}  spc=toggle  a=all  n=none  enter=ok  q=abort"
-    local sl_plain; sl_plain="$(printf '%s' "$status_line" | sed 's/\x1b\[[0-9;]*m//g')"
-    local trunc_w=$(( inner_w ))
-    [[ ${#sl_plain} -gt $trunc_w ]] && status_line="${status_line:0:$trunc_w}"
-    printf -v sl_plain '%-*s' "$trunc_w" "${sl_plain:0:$trunc_w}"
-    # reprint with ansi preserved but padded
-    local sl_ansi="${status_line}"
-    local sl_ansi_plain; sl_ansi_plain="$(printf '%s' "$sl_ansi" | sed 's/\x1b\[[0-9;]*m//g')"
-    local sl_pad=$(( trunc_w - ${#sl_ansi_plain} ))
-    printf -v _pad '%-*s' "$sl_pad" ''
-    out+="${BRED}║${RST}${sl_ansi}${_pad}${BRED}║${RST}\n"
-
-    # bottom border
-    out+="${BRED}╚"; for (( bi=0; bi<inner_w; bi++ )); do out+="═"; done; out+="╝${RST}\n"
-
-    printf '%s' "$out" > /dev/tty
-  }
-
-  # Save/restore terminal state
-  local old_stty; old_stty="$(stty -g 2>/dev/null || true)"
-  tput smcup   > /dev/tty 2>/dev/null || true
-  tput civis   > /dev/tty 2>/dev/null || true
-  stty -echo -icanon min 1 time 0 2>/dev/null || true
-
-  local result=1
-  _rebuild_view
-  _draw
-
-  while true; do
-    local key
-    IFS= read -r -s -n1 key 2>/dev/null <>/dev/tty || true
-
-    if [[ $search_mode -eq 1 ]]; then
-      case "$key" in
-        $'\x1b') search_mode=0; query=""; _rebuild_view ;;
-        $'\x7f'|$'\b') query="${query%?}" ;;
-        '') search_mode=0 ;;  # enter closes search
-        *) query+="$key" ;;
-      esac
-      _draw; continue
-    fi
-
-    # handle escape sequences for arrows
-    if [[ "$key" == $'\x1b' ]]; then
-      local seq1 seq2
-      IFS= read -r -s -n1 -t 0.1 seq1 <>/dev/tty || true
-      IFS= read -r -s -n1 -t 0.1 seq2 <>/dev/tty || true
-      key="${key}${seq1}${seq2}"
-    fi
-
-    case "$key" in
-      $'\x1b[A'|k)  # up
-        (( cursor > 0 )) && (( cursor-- ))
-        if [[ $cursor -lt $scroll ]]; then (( scroll-- )); fi
-        ;;
-      $'\x1b[B'|j)  # down
-        (( cursor < ${#view[@]} - 1 )) && (( cursor++ ))
-        if [[ $cursor -ge $(( scroll + list_h )) ]]; then (( scroll++ )); fi
-        ;;
-      $'\x1b[5~')  # page up
-        cursor=$(( cursor - list_h < 0 ? 0 : cursor - list_h ))
-        scroll=$(( cursor < scroll ? cursor : scroll ))
-        ;;
-      $'\x1b[6~')  # page down
-        local last=$(( ${#view[@]} - 1 ))
-        cursor=$(( cursor + list_h > last ? last : cursor + list_h ))
-        if [[ $cursor -ge $(( scroll + list_h )) ]]; then scroll=$(( cursor - list_h + 1 )); fi
-        ;;
-      ' ')  # toggle
-        if [[ ${#view[@]} -gt 0 ]]; then
-          local ri="${view[$cursor]}"
-          checked[$ri]=$(( 1 - checked[$ri] ))
-        fi
-        ;;
-      a)  for (( i=0; i<${#items[@]}; i++ )); do checked[$i]=1; done ;;
-      n)  for (( i=0; i<${#items[@]}; i++ )); do checked[$i]=0; done ;;
-      /)  search_mode=1 ;;
-      $'\n')  # enter — confirm
-        result=0; break ;;
-      q|Q|$'\x1b\x1b')  # quit/abort
-        result=1; break ;;
-    esac
-    _draw
-  done
-
-  # Restore terminal
-  stty "$old_stty"            2>/dev/null || true
-  tput cnorm  > /dev/tty      2>/dev/null || true
-  tput rmcup  > /dev/tty      2>/dev/null || true
-
-  if [[ $result -eq 0 ]]; then
-    for (( i=0; i<${#items[@]}; i++ )); do
-      [[ "${checked[$i]}" -eq 1 ]] && printf '%s\n' "${items[$i]}"
-    done
+  local selected
+  if command -v whiptail >/dev/null 2>&1; then
+    selected="$(whiptail --title "$title" --checklist "$prompt" \
+      "$height" "$width" "$list_height" "$@" 3>&1 1>&2 2>&3)" || return 1
+  elif command -v dialog >/dev/null 2>&1; then
+    selected="$(dialog --stdout --title "$title" --checklist "$prompt" \
+      "$height" "$width" "$list_height" "$@")" || return 1
+  else
+    echo "No TUI available (whiptail or dialog required)" >&2
+    return 1
   fi
-  return $result
+
+  [[ -z "$selected" ]] && return 1
+  # whiptail/dialog output: "pkg1" "pkg2" ...  →  one per line
+  echo "$selected" | tr ' ' '\n' | sed 's/^"//;s/"$//'
 }
 
 resolve_dependencies() {
@@ -907,7 +705,7 @@ maybe_stop_after() {
 [[ ${EUID} -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
 
 BASE_ISO=""
-BASE_ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.10.0-amd64-netinst.iso"
+BASE_ISO_URL="https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKDIR="$SCRIPT_DIR/build"
 CACHE_DIR=""
@@ -926,19 +724,19 @@ STOP_AFTER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base-iso) BASE_ISO="$2"; shift 2 ;;
-    --base-iso-url) BASE_ISO_URL="$2"; shift 2 ;;
-    --cache-dir) CACHE_DIR="$2"; shift 2 ;;
-    --workdir) WORKDIR="$2"; shift 2 ;;
-    --output) OUTPUT_ISO="$2"; shift 2 ;;
-    --hostname) HOSTNAME_VALUE="$2"; shift 2 ;;
+    --base-iso) [[ $# -ge 2 ]] || { echo "--base-iso requires an argument" >&2; exit 1; }; BASE_ISO="$2"; shift 2 ;;
+    --base-iso-url) [[ $# -ge 2 ]] || { echo "--base-iso-url requires an argument" >&2; exit 1; }; BASE_ISO_URL="$2"; shift 2 ;;
+    --cache-dir) [[ $# -ge 2 ]] || { echo "--cache-dir requires an argument" >&2; exit 1; }; CACHE_DIR="$2"; shift 2 ;;
+    --workdir) [[ $# -ge 2 ]] || { echo "--workdir requires an argument" >&2; exit 1; }; WORKDIR="$2"; shift 2 ;;
+    --output) [[ $# -ge 2 ]] || { echo "--output requires an argument" >&2; exit 1; }; OUTPUT_ISO="$2"; shift 2 ;;
+    --hostname) [[ $# -ge 2 ]] || { echo "--hostname requires an argument" >&2; exit 1; }; HOSTNAME_VALUE="$2"; shift 2 ;;
     --include-settings) INCLUDE_SETTINGS=1; INCLUDE_SETTINGS_SET=1; shift ;;
-    --snapshot-paths) SNAPSHOT_PATHS="$2"; shift 2 ;;
+    --snapshot-paths) [[ $# -ge 2 ]] || { echo "--snapshot-paths requires an argument" >&2; exit 1; }; SNAPSHOT_PATHS="$2"; shift 2 ;;
     --download-packages) DOWNLOAD_PACKAGES=1; DOWNLOAD_PACKAGES_SET=1; shift ;;
-    --offline-packages-file) OFFLINE_PACKAGES_FILE="$2"; shift 2 ;;
-    --selector-scope) SELECTOR_SCOPE="$2"; shift 2 ;;
+    --offline-packages-file) [[ $# -ge 2 ]] || { echo "--offline-packages-file requires an argument" >&2; exit 1; }; OFFLINE_PACKAGES_FILE="$2"; shift 2 ;;
+    --selector-scope) [[ $# -ge 2 ]] || { echo "--selector-scope requires an argument" >&2; exit 1; }; SELECTOR_SCOPE="$2"; shift 2 ;;
     --resume) RESUME=1; shift ;;
-    --stop-after) STOP_AFTER="$2"; shift 2 ;;
+    --stop-after) [[ $# -ge 2 ]] || { echo "--stop-after requires an argument" >&2; exit 1; }; STOP_AFTER="$2"; shift 2 ;;
     --no-tui) USE_TUI=0; shift ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
@@ -954,7 +752,7 @@ done
   exit 1
 }
 
-for c in dpkg-query apt-get apt-cache rsync xorriso tar zstd awk sed mount umount; do require_bin "$c"; done
+for c in dpkg-query apt-get apt-cache xorriso tar gzip awk sed mount umount; do require_bin "$c"; done
 
 # Apply theme now that USE_TUI is finalised
 [[ $USE_TUI -eq 1 ]] && setup_tui_theme
@@ -979,7 +777,7 @@ else
     DOWNLOAD_PACKAGES=1
   fi
 fi
-[[ $DOWNLOAD_PACKAGES -eq 0 ]] || require_bin apt-ftparchive
+[[ $DOWNLOAD_PACKAGES -eq 0 ]] || require_bin dpkg-deb
 
 
 CACHE_DIR="${CACHE_DIR:-$SCRIPT_DIR/.cache}"
@@ -1004,8 +802,12 @@ validate_path "$WORKDIR"     "Work directory" || { echo "Invalid work directory 
 validate_path "$CACHE_DIR"   "Cache directory" || { echo "Invalid cache directory path. Aborting." >&2; exit 1; }
 validate_path "$BASE_ISO"    "Base ISO"     || { echo "Invalid base ISO path. Aborting." >&2; exit 1; }
 validate_url  "$BASE_ISO_URL"               || { echo "Invalid base ISO URL. Aborting." >&2; exit 1; }
+[[ -z "$OFFLINE_PACKAGES_FILE" || -f "$OFFLINE_PACKAGES_FILE" ]] || { echo "--offline-packages-file does not exist: $OFFLINE_PACKAGES_FILE" >&2; exit 1; }
 
-cleanup() { mountpoint -q "$MNT_BASE" && umount "$MNT_BASE" || true; }
+cleanup() {
+  mountpoint -q "$MNT_BASE" && umount "$MNT_BASE" || true
+  [[ -n "${DIALOGRC_FILE:-}" && -f "$DIALOGRC_FILE" ]] && rm -f "$DIALOGRC_FILE"
+}
 trap cleanup EXIT
 
 # PRE-PLAN / PREVIEW (no writes/downloads yet)
@@ -1064,11 +866,13 @@ fi
 
 if ! is_stage_done download || [[ ! -f "$BASE_ISO" ]]; then
   [[ -f "$BASE_ISO" ]] || {
+    # Resolve the actual ISO URL from the directory listing if needed
+    _resolved_url="$(resolve_iso_url "$BASE_ISO_URL")"
     tui_msg "Downloading base Debian netinst ISO to persistent cache..."
     if command -v curl >/dev/null 2>&1; then
-      curl -L --fail -o "$BASE_ISO" "$BASE_ISO_URL"
+      curl -L --fail -o "$BASE_ISO" "$_resolved_url"
     elif command -v wget >/dev/null 2>&1; then
-      wget -O "$BASE_ISO" "$BASE_ISO_URL"
+      wget -O "$BASE_ISO" "$_resolved_url"
     else
       echo "Need curl or wget to download base ISO." >&2
       exit 1
@@ -1086,7 +890,7 @@ if ! is_stage_done extract || [[ $RESUME -eq 0 ]]; then
   rm -rf "$ISO_ROOT"
   mkdir -p "$ISO_ROOT"
   mount -o loop,ro "$BASE_ISO" "$MNT_BASE"
-  rsync -a --delete "$MNT_BASE/" "$ISO_ROOT/"
+  cp -a "$MNT_BASE/." "$ISO_ROOT/"
   umount "$MNT_BASE"
   mark_stage_done extract
 else
@@ -1114,7 +918,7 @@ if ! is_stage_done payload || [[ $RESUME -eq 0 ]]; then
   if [[ $INCLUDE_SETTINGS -eq 1 ]]; then
     tui_msg "Creating settings snapshot archive..."
     printf '%s' "$SNAPSHOT_PATHS" | tr ',' '\n' > "$PAYLOAD_DIR/snapshot-paths.txt"
-    TAR_ARGS=(--acls --xattrs --numeric-owner --zstd -cpf "$CUSTOM_DIR/system-config.tar.zst"
+    TAR_ARGS=(--acls --xattrs --numeric-owner -cpf "$CUSTOM_DIR/system-config.tar.gz"
       --exclude=/etc/machine-id
       --exclude=/etc/fstab
       --exclude=/etc/mtab
@@ -1162,7 +966,7 @@ if ! is_stage_done payload || [[ $RESUME -eq 0 ]]; then
       tui_msg "Downloading packages and building offline repository..."
       REPO_DIR="$CUSTOM_DIR/repo"
       mkdir -p "$REPO_DIR/pool"
-      chown _apt "$REPO_DIR/pool"
+      id -u _apt >/dev/null 2>&1 && chown _apt "$REPO_DIR/pool" || true
       apt-get update
 
       while IFS= read -r pkg; do
@@ -1178,7 +982,19 @@ if ! is_stage_done payload || [[ $RESUME -eq 0 ]]; then
         fi
       done < "$PAYLOAD_DIR/offline-expanded.txt"
 
-      (cd "$REPO_DIR" && apt-ftparchive packages pool > Packages && gzip -9c Packages > Packages.gz)
+      (cd "$REPO_DIR" && \
+        for f in pool/*.deb; do \
+          [ -f "$f" ] || continue; \
+          printf 'Package: %s\nVersion: %s\nArchitecture: %s\nFilename: %s\nSize: %s\nSHA256: %s\nMaintainer: %s\nDescription: %s\n\n' \
+            "$(dpkg-deb --field "$f" Package)" \
+            "$(dpkg-deb --field "$f" Version)" \
+            "$(dpkg-deb --field "$f" Architecture)" \
+            "$f" \
+            "$(stat -c%s "$f")" \
+            "$(sha256sum "$f" | cut -d' ' -f1)" \
+            "$(dpkg-deb --field "$f" Maintainer)" \
+            "$(dpkg-deb --field "$f" Description)"; \
+        done > Packages && gzip -9c Packages > Packages.gz)
       cp "$PAYLOAD_DIR/offline-selected.txt" "$CUSTOM_DIR/"
       cp "$PAYLOAD_DIR/offline-expanded.txt" "$CUSTOM_DIR/"
     fi
@@ -1216,8 +1032,8 @@ if [[ -f /root/custom/package-versions.tsv ]]; then
   done < /root/custom/package-versions.tsv
 fi
 
-if [[ -f /root/custom/system-config.tar.zst ]]; then
-  tar --zstd -xpf /root/custom/system-config.tar.zst -C /
+if [[ -f /root/custom/system-config.tar.gz ]]; then
+  tar -xpf /root/custom/system-config.tar.gz -C /
 fi
 
 systemctl preset-all >/dev/null 2>&1 || true
@@ -1258,7 +1074,10 @@ menuentry 'Install customized Debian from this ISO' {
 GRUB
   fi
 
-  ISOHYBRID_MBR="/usr/lib/ISOLINUX/isohdpfx.bin"
+  for _mbr in /usr/lib/ISOLINUX/isohdpfx.bin /usr/lib/syslinux/isohdpfx.bin; do
+    [[ -f "$_mbr" ]] && { ISOHYBRID_MBR="$_mbr"; break; }
+  done
+  ISOHYBRID_MBR="${ISOHYBRID_MBR:-}"
   # Pass the output path via xorriso native -outdev BEFORE -as mkisofs.
   # The mkisofs compat layer re-tokenises its argv on whitespace, so a path
   # containing spaces is silently split when given as mkisofs -o.  Using
